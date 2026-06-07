@@ -8,11 +8,29 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+_DESKTOP_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _DESKTOP_DIR.parent
+_SHARED_DIR = _REPO_ROOT / "shared"
+if str(_SHARED_DIR) not in sys.path:
+    sys.path.insert(0, str(_SHARED_DIR))
 
 import requests
 import tkinter as tk
 import tkinter.font as tkfont
+
+from translation_core import (
+    TARGET_LANGUAGE,
+    TranslationResult,
+    build_system_prompt,
+    build_translation_result,
+    detect_source_language,
+    format_route_label,
+    parse_source_langs,
+    should_skip_translation,
+)
 
 
 def env_int(name: str, default: int) -> int:
@@ -38,7 +56,17 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_env_file(path: str = ".env") -> None:
+def load_env_file(path: str | None = None) -> None:
+    if path is None:
+        candidates = [
+            _DESKTOP_DIR / ".env",
+            _REPO_ROOT / ".env",
+        ]
+        path_obj = next((item for item in candidates if item.exists()), None)
+        if path_obj is None:
+            return
+        path = str(path_obj)
+
     if not os.path.exists(path):
         return
 
@@ -70,6 +98,7 @@ def load_env_file(path: str = ".env") -> None:
 class AppConfig:
     source_lang: str
     target_lang: str
+    supported_source_langs: tuple[str, ...]
     debounce_ms: int
     clipboard_poll_ms: int
     max_text_length: int
@@ -101,7 +130,8 @@ class AppConfig:
 
         return cls(
             source_lang=os.getenv("SOURCE_LANG", "auto"),
-            target_lang=os.getenv("TARGET_LANG", "zh-CN"),
+            target_lang=os.getenv("TARGET_LANG", TARGET_LANGUAGE.code),
+            supported_source_langs=parse_source_langs(os.getenv("SUPPORTED_SOURCE_LANGS")),
             debounce_ms=env_int("DEBOUNCE_MS", 350),
             clipboard_poll_ms=env_int("CLIPBOARD_POLL_MS", 500),
             max_text_length=env_int("MAX_TEXT_LENGTH", 1000),
@@ -149,15 +179,43 @@ class TranslatorService:
         self.http = requests.Session()
         self.http.trust_env = config.hf_use_env_proxy
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str) -> TranslationResult:
         if not self.config.hf_token:
             raise RuntimeError("HF_TOKEN is required for HuggingFace backend.")
 
-        if self.config.hf_base_url.endswith("/v1"):
-            return self._translate_openai_compatible(text)
-        return self._translate_inference_api(text)
+        detected = self._resolve_source_language(text)
+        skip, _reason = should_skip_translation(text, detected, self.config.target_lang)
+        if skip:
+            return build_translation_result(
+                source_text=text,
+                translated_text=text,
+                source_lang=detected,
+                target_lang=self.config.target_lang,
+                skipped=True,
+            )
 
-    def _translate_openai_compatible(self, text: str) -> str:
+        if self.config.hf_base_url.endswith("/v1"):
+            translated = self._translate_openai_compatible(text, detected)
+        else:
+            translated = self._translate_inference_api(text, detected)
+
+        return build_translation_result(
+            source_text=text,
+            translated_text=translated,
+            source_lang=detected,
+            target_lang=self.config.target_lang,
+        )
+
+    def resolve_source_language(self, text: str) -> str:
+        return self._resolve_source_language(text)
+
+    def _resolve_source_language(self, text: str) -> str:
+        configured = self.config.source_lang.strip().lower()
+        if configured and configured != "auto":
+            return configured
+        return detect_source_language(text, self.config.supported_source_langs)
+
+    def _translate_openai_compatible(self, text: str, source_lang: str) -> str:
         endpoint = f"{self.config.hf_base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.config.hf_token}",
@@ -166,7 +224,7 @@ class TranslatorService:
         payload = {
             "model": self.config.hf_model_id,
             "messages": [
-                {"role": "system", "content": self._build_system_prompt()},
+                {"role": "system", "content": self._build_system_prompt(source_lang)},
                 {"role": "user", "content": text},
             ],
             "max_tokens": self.config.hf_max_new_tokens,
@@ -178,14 +236,14 @@ class TranslatorService:
             raise RuntimeError("HuggingFace returned empty translation output.")
         return self._normalize_output(translated)
 
-    def _translate_inference_api(self, text: str) -> str:
+    def _translate_inference_api(self, text: str, source_lang: str) -> str:
         endpoint = f"{self.config.hf_base_url}/models/{self.config.hf_model_id}"
         headers = {
             "Authorization": f"Bearer {self.config.hf_token}",
             "Content-Type": "application/json",
         }
         payload = {
-            "inputs": f"{self._build_system_prompt()}\n\nUser text:\n{text}",
+            "inputs": f"{self._build_system_prompt(source_lang)}\n\nUser text:\n{text}",
             "parameters": {
                 "max_new_tokens": self.config.hf_max_new_tokens,
                 "temperature": self.config.hf_temperature,
@@ -228,18 +286,11 @@ class TranslatorService:
 
         raise RuntimeError("HuggingFace request failed after retries.")
 
-    def _build_system_prompt(self) -> str:
-        source = self.config.source_lang.strip() or "auto"
-        target = self.config.target_lang.strip() or "zh-CN"
-        if source.lower() == "auto":
-            source_hint = "Detect the source language automatically."
-        else:
-            source_hint = f"Source language: {source}."
-        return (
-            "You are a professional translation engine.\n"
-            f"{source_hint}\n"
-            f"Translate the user text into {target}.\n"
-            "Return only translated text without explanation."
+    def _build_system_prompt(self, detected_source_lang: str) -> str:
+        return build_system_prompt(
+            source_lang=detected_source_lang,
+            target_lang=self.config.target_lang.strip() or TARGET_LANGUAGE.code,
+            allowed_sources=self.config.supported_source_langs,
         )
 
     @staticmethod
@@ -366,10 +417,9 @@ class TranslatorService:
 
 class TkTranslatorApp:
     URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$", re.IGNORECASE)
-    TOPMOST_ENFORCE_MS = 50
-    TOPMOST_HARD_RESET_EVERY = 8
-    TOPMOST_AGGRESSIVE_EVERY = 10
-    TOPMOST_X11_REAPPLY_EVERY = 20
+    TOPMOST_ENFORCE_MS = 90
+    TOPMOST_X11_REAPPLY_EVERY = 8
+    TOPMOST_HARD_RESET_COOLDOWN_MS = 1000
 
     def __init__(self, config: AppConfig, service: TranslatorService):
         self.config = config
@@ -381,7 +431,7 @@ class TkTranslatorApp:
         self.last_processed_text = ""
         self.last_processed_at = 0.0
         self.in_flight: dict[str, float] = {}
-        self.result_queue: queue.Queue[tuple[str, str | None, str | None]] = queue.Queue()
+        self.result_queue: queue.Queue[tuple[TranslationResult | None, str | None, str]] = queue.Queue()
 
         self._debounce_after_id: str | None = None
         self._running = True
@@ -393,6 +443,7 @@ class TkTranslatorApp:
         self._iconic_warned = False
         self._topmost_tick = 0
         self._xprop_supported = False
+        self._last_hard_reset_at = 0.0
 
         self.root = tk.Tk()
         self.root.title("Clipboard Translator")
@@ -409,22 +460,25 @@ class TkTranslatorApp:
         self._pil_font = None
         self._pil_imagetk = None
         self._pil_font_path: str | None = None
+        self._title_photo = None
+        self._source_photo = None
+        self._status_photo = None
         self._translated_photo = None
         self._init_image_text_renderer()
 
-        self.source_var = tk.StringVar(value="")
-        self.translated_var = tk.StringVar(value="")
-        self.status_var = tk.StringVar(value="Ready")
-
         self._build_ui()
+        self._render_static_title()
         self._place_top_right()
         self._init_x11_topmost_support()
+        self._ensure_window_shown()
         self._enforce_topmost()
+        self.root.after(0, self._ensure_window_shown)
+        self.root.after(200, self._ensure_window_shown)
         self.root.bind("<FocusIn>", lambda _event: self._enforce_topmost())
         self.root.bind("<FocusOut>", lambda _event: self._schedule_topmost_burst())
         self.root.bind("<Map>", lambda _event: self._enforce_topmost())
         self.root.bind("<Visibility>", lambda _event: self._schedule_topmost_burst())
-        self.show_status("Ready. Copy text to translate.")
+        self.show_status("就绪：复制英语/日语/韩语/越南语文本，自动译为中文。")
 
         self.root.after(max(100, config.clipboard_poll_ms), self._poll_clipboard)
         self.root.after(80, self._process_result_queue)
@@ -436,11 +490,6 @@ class TkTranslatorApp:
             print(f"[clipboard-translator][tk] {message}", flush=True)
 
     def _build_ui(self) -> None:
-        title_font = (self._font_family, 11, "bold")
-        body_font = (self._font_family, 10)
-        translated_font = (self._font_family, 11, "bold")
-        status_font = (self._font_family, 9)
-
         card = tk.Frame(self.root, bg="#111827", bd=1, relief="solid")
         card.pack(fill="both", expand=True, padx=1, pady=1)
 
@@ -449,60 +498,46 @@ class TkTranslatorApp:
 
         title = tk.Label(
             top_row,
-            text="Clipboard Translation",
+            justify="left",
+            anchor="w",
             fg="#f9fafb",
             bg="#111827",
-            font=title_font,
         )
         title.pack(side="left")
+        self.title_label = title
 
-        source_label = tk.Label(
+        self.source_label = tk.Label(
             card,
-            textvariable=self.source_var,
             justify="left",
             anchor="w",
             fg="#9ca3af",
             bg="#111827",
             wraplength=420,
-            font=body_font,
         )
-        source_label.pack(fill="x", padx=10, pady=(0, 4))
+        self.source_label.pack(fill="x", padx=10, pady=(0, 4))
 
         self.translated_container = tk.Frame(card, bg="#111827")
         self.translated_container.pack(fill="x", padx=10, pady=(0, 6))
 
-        self.translated_text_label = tk.Label(
+        self.translated_label = tk.Label(
             self.translated_container,
-            textvariable=self.translated_var,
             justify="left",
             anchor="w",
             fg="#f9fafb",
             bg="#111827",
             wraplength=420,
-            font=translated_font,
         )
-        self.translated_text_label.pack(fill="x")
+        self.translated_label.pack(fill="x")
 
-        self.translated_image_label = tk.Label(
-            self.translated_container,
-            justify="left",
-            anchor="w",
-            bg="#111827",
-            bd=0,
-            highlightthickness=0,
-        )
-
-        status_label = tk.Label(
+        self.status_label = tk.Label(
             card,
-            textvariable=self.status_var,
             justify="left",
             anchor="w",
             fg="#60a5fa",
             bg="#111827",
             wraplength=420,
-            font=status_font,
         )
-        status_label.pack(fill="x", padx=10, pady=(0, 8))
+        self.status_label.pack(fill="x", padx=10, pady=(0, 8))
 
         for widget in (top_row, title):
             widget.bind("<ButtonPress-1>", self._on_drag_start)
@@ -516,6 +551,52 @@ class TkTranslatorApp:
         x = max(0, self.root.winfo_screenwidth() - width - self.config.margin_px)
         y = max(0, self.config.margin_px)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self._clamp_window_to_screen()
+
+    def _clamp_window_to_screen(self) -> None:
+        try:
+            self.root.update_idletasks()
+            width = max(1, self.root.winfo_width())
+            height = max(1, self.root.winfo_height())
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            margin = max(0, self.config.margin_px)
+
+            new_x, new_y = x, y
+            if x < margin:
+                new_x = margin
+            elif x + width > screen_w - margin:
+                new_x = max(margin, screen_w - width - margin)
+            if y < margin:
+                new_y = margin
+            elif y + height > screen_h - margin:
+                new_y = max(margin, screen_h - height - margin)
+
+            if new_x != x or new_y != y:
+                self.root.geometry(f"{width}x{height}+{new_x}+{new_y}")
+        except tk.TclError:
+            pass
+
+    def _ensure_window_shown(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self._clamp_window_to_screen()
+            self.root.attributes("-topmost", True)
+            self.root.wm_attributes("-topmost", 1)
+            self.root.lift()
+            self.root.update_idletasks()
+            self._log(
+                "window shown "
+                f"state={self.root.state()} "
+                f"mapped={self.root.winfo_ismapped()} "
+                f"geometry={self.root.geometry()} "
+                f"screen={self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}"
+            )
+        except tk.TclError:
+            pass
 
     def _select_display_font_family(self) -> str:
         preferred_families = [
@@ -564,7 +645,7 @@ class TkTranslatorApp:
 
     def _resolve_render_font_file(self) -> str | None:
         candidates = [
-            os.path.join(os.path.dirname(__file__), ".font-cache", "NotoSansCJKsc-Regular.otf"),
+            os.path.join(str(_DESKTOP_DIR), ".font-cache", "NotoSansCJKsc-Regular.otf"),
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
             "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -582,7 +663,7 @@ class TkTranslatorApp:
         return self._download_fallback_font()
 
     def _download_fallback_font(self) -> str | None:
-        cache_dir = os.path.join(os.path.dirname(__file__), ".font-cache")
+        cache_dir = os.path.join(str(_DESKTOP_DIR), ".font-cache")
         os.makedirs(cache_dir, exist_ok=True)
         target = os.path.join(cache_dir, "NotoSansCJKsc-Regular.otf")
         if os.path.exists(target):
@@ -603,21 +684,41 @@ class TkTranslatorApp:
             return None
 
     @staticmethod
-    def _contains_non_ascii(text: str) -> bool:
-        return any(ord(ch) > 127 for ch in text)
+    def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+        value = value.lstrip("#")
+        if len(value) != 6:
+            return 249, 250, 251
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
 
-    def _render_text_to_photo(self, text: str, width: int, font_size: int) -> Any | None:
-        if not (self._pil_image and self._pil_draw and self._pil_font and self._pil_imagetk and self._pil_font_path):
+    def _load_pil_font(self, font_size: int):
+        if not (self._pil_font and self._pil_font_path):
+            return None
+        try:
+            if self._pil_font_path.lower().endswith(".ttc"):
+                return self._pil_font.truetype(self._pil_font_path, font_size, index=0)
+            return self._pil_font.truetype(self._pil_font_path, font_size)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return None
+
+    def _render_text_to_photo(
+        self,
+        text: str,
+        width: int,
+        font_size: int,
+        *,
+        fill: tuple[int, int, int] = (249, 250, 251),
+        background: tuple[int, int, int] = (17, 24, 39),
+    ) -> Any | None:
+        if not (self._pil_image and self._pil_draw and self._pil_imagetk):
             return None
         if not text.strip():
             return None
 
-        try:
-            font = self._pil_font.truetype(self._pil_font_path, font_size)
-        except Exception:  # pylint: disable=broad-exception-caught
+        font = self._load_pil_font(font_size)
+        if font is None:
             return None
 
-        probe = self._pil_image.new("RGB", (8, 8), (0, 0, 0))
+        probe = self._pil_image.new("RGB", (8, 8), background)
         draw = self._pil_draw.Draw(probe)
 
         def text_width(s: str) -> float:
@@ -652,43 +753,95 @@ class TkTranslatorApp:
         image_width = width + pad * 2
         image_height = pad * 2 + len(lines) * line_height + max(0, len(lines) - 1) * line_spacing
 
-        image = self._pil_image.new("RGBA", (image_width, image_height), (17, 24, 39, 255))
+        image = self._pil_image.new("RGBA", (image_width, image_height), (*background, 255))
         canvas = self._pil_draw.Draw(image)
         y = pad
         for line in lines:
-            canvas.text((pad, y), line, font=font, fill=(249, 250, 251, 255))
+            canvas.text((pad, y), line, font=font, fill=(*fill, 255))
             y += line_height + line_spacing
 
         return self._pil_imagetk.PhotoImage(image)
 
-    def _set_translated_display(self, text: str) -> None:
-        if text and self._contains_non_ascii(text):
-            photo = self._render_text_to_photo(text=text, width=420, font_size=18)
+    def _set_label_content(
+        self,
+        label: tk.Label,
+        photo_attr: str,
+        text: str,
+        *,
+        width: int = 420,
+        font_size: int = 11,
+        color: str = "#f9fafb",
+        fallback_font: tuple[str, int] | tuple[str, int, str] = ("TkDefaultFont", 10),
+    ) -> None:
+        cleaned = text or ""
+        if cleaned and self._pil_font_path:
+            photo = self._render_text_to_photo(
+                text=cleaned,
+                width=width,
+                font_size=font_size,
+                fill=self._hex_to_rgb(color),
+            )
             if photo is not None:
-                self._translated_photo = photo
-                self.translated_image_label.configure(image=photo)
-                if not self.translated_image_label.winfo_ismapped():
-                    self.translated_text_label.pack_forget()
-                    self.translated_image_label.pack(fill="x")
+                setattr(self, photo_attr, photo)
+                label.configure(image=photo, text="", font=fallback_font)
                 return
 
-        self._translated_photo = None
-        self.translated_var.set(text)
-        if not self.translated_text_label.winfo_ismapped():
-            self.translated_image_label.pack_forget()
-            self.translated_text_label.pack(fill="x")
+        setattr(self, photo_attr, None)
+        label.configure(image="", text=cleaned, font=fallback_font)
+
+    def _render_static_title(self) -> None:
+        self._set_label_content(
+            self.title_label,
+            "_title_photo",
+            "多语翻译 → 中文",
+            width=420,
+            font_size=13,
+            color="#f9fafb",
+            fallback_font=(self._font_family, 11, "bold"),
+        )
+
+    def _set_translated_display(self, text: str) -> None:
+        self._set_label_content(
+            self.translated_label,
+            "_translated_photo",
+            text,
+            width=420,
+            font_size=18,
+            color="#f9fafb",
+            fallback_font=(self._font_family, 11, "bold"),
+        )
+
+    def _set_source_display(self, text: str) -> None:
+        self._set_label_content(
+            self.source_label,
+            "_source_photo",
+            text,
+            width=420,
+            font_size=11,
+            color="#9ca3af",
+            fallback_font=(self._font_family, 10),
+        )
+
+    def _set_status_display(self, text: str) -> None:
+        self._set_label_content(
+            self.status_label,
+            "_status_photo",
+            text,
+            width=420,
+            font_size=10,
+            color="#60a5fa",
+            fallback_font=(self._font_family, 9),
+        )
 
     def _apply_platform_topmost_hint(self) -> None:
-        # On Linux/WSLg some WMs honor dock/splash hints for persistent top layers.
-        try:
-            self.root.wm_attributes("-type", "dock")
-            return
-        except tk.TclError:
-            pass
-        try:
-            self.root.wm_attributes("-type", "splash")
-        except tk.TclError:
-            pass
+        # utility/splash are less likely to be repositioned off-screen than dock on WSLg.
+        for window_type in ("utility", "splash", "dock"):
+            try:
+                self.root.wm_attributes("-type", window_type)
+                self._log(f"using wm window type: {window_type}")
+                return
+            except tk.TclError:
+                continue
 
     def _init_x11_topmost_support(self) -> None:
         self._xprop_supported = bool(shutil.which("xprop"))
@@ -720,7 +873,7 @@ class TkTranslatorApp:
                 "32a",
                 "-set",
                 "_NET_WM_WINDOW_TYPE",
-                "_NET_WM_WINDOW_TYPE_DOCK",
+                "_NET_WM_WINDOW_TYPE_UTILITY",
             ],
         ]
         for cmd in cmds:
@@ -737,25 +890,33 @@ class TkTranslatorApp:
             pass
         self._enforce_topmost()
 
-    def _force_above_once(self) -> None:
+    def _schedule_topmost_burst(self) -> None:
+        # Keep reassert lightweight, with one throttled hard reset as fallback.
+        self._enforce_topmost()
+        self.root.after(70, self._hard_reassert_topmost)
+        self.root.after(220, self._enforce_topmost)
+        self.root.after(420, self._enforce_topmost)
+
+    def _hard_reassert_topmost(self) -> None:
+        if self._dragging or not self._running:
+            return
+        now = time.monotonic()
+        elapsed_ms = (now - self._last_hard_reset_at) * 1000
+        if elapsed_ms < self.TOPMOST_HARD_RESET_COOLDOWN_MS:
+            return
+        self._last_hard_reset_at = now
+
         try:
-            # One-shot hard reset used in bursts after focus/visibility changes.
+            # Some WMs require a one-shot topmost reset after focus loss.
             self.root.attributes("-topmost", False)
             self.root.wm_attributes("-topmost", 0)
             self.root.attributes("-topmost", True)
             self.root.wm_attributes("-topmost", 1)
             self.root.lift()
             self._apply_x11_above_state()
+            self._clamp_window_to_screen()
         except tk.TclError:
-            pass
-
-    def _schedule_topmost_burst(self) -> None:
-        # Re-assert topmost in short hard bursts after focus/visibility changes.
-        self._force_above_once()
-        self.root.after(20, self._force_above_once)
-        self.root.after(70, self._force_above_once)
-        self.root.after(150, self._force_above_once)
-        self.root.after(300, self._force_above_once)
+            return
 
     def _enforce_topmost(self) -> None:
         try:
@@ -771,8 +932,6 @@ class TkTranslatorApp:
     def _keep_topmost(self) -> None:
         if not self._running:
             return
-        if self._topmost_tick % self.TOPMOST_AGGRESSIVE_EVERY == 0:
-            self._schedule_topmost_burst()
         self._enforce_topmost()
         self.root.after(self.TOPMOST_ENFORCE_MS, self._keep_topmost)
 
@@ -787,9 +946,11 @@ class TkTranslatorApp:
         x = event.x_root - self._drag_start_x
         y = event.y_root - self._drag_start_y
         self.root.geometry(f"+{x}+{y}")
+        self._clamp_window_to_screen()
 
     def _on_drag_end(self, _event) -> None:
         self._dragging = False
+        self._clamp_window_to_screen()
 
     def _keep_window_visible(self) -> None:
         if not self._running:
@@ -876,6 +1037,9 @@ class TkTranslatorApp:
     def _queue_text(self, text: str, trigger: str) -> None:
         self.pending_text = text
         self._log(f"clipboard update received ({trigger}, {len(text)} chars)")
+        preview = text if len(text) <= 160 else text[:157] + "..."
+        self._set_source_display(preview)
+        self._set_status_display("已检测到剪贴板，准备翻译...")
         if self._debounce_after_id:
             try:
                 self.root.after_cancel(self._debounce_after_id)
@@ -885,13 +1049,17 @@ class TkTranslatorApp:
 
     def _skip_reason(self, text: str) -> str | None:
         if len(text) < self.config.min_text_length:
-            return "text too short"
+            return "文本太短，未翻译"
         if self.URL_ONLY_RE.match(text):
-            return "url only"
+            return "仅 URL 链接，未翻译"
         if self.config.repeat_cooldown_ms > 0 and text == self.last_processed_text and self.last_processed_at > 0:
             elapsed_ms = int((time.monotonic() - self.last_processed_at) * 1000)
             if elapsed_ms < self.config.repeat_cooldown_ms:
-                return f"same as last text within cooldown ({elapsed_ms}ms)"
+                return f"相同内容冷却中（{elapsed_ms}ms）"
+        detected = self.service.resolve_source_language(text)
+        skip, reason = should_skip_translation(text, detected, self.config.target_lang)
+        if skip:
+            return reason
         return None
 
     def _process_pending_text(self, force: bool = False) -> None:
@@ -903,16 +1071,28 @@ class TkTranslatorApp:
 
         reason = None if force else self._skip_reason(text)
         if reason:
+            preview = text if len(text) <= 160 else text[:157] + "..."
+            self._set_source_display(preview)
+            self._set_translated_display("")
+            self._set_status_display(f"已跳过：{reason}")
             self._log(f"skip translation: {reason}")
             return
 
         text = text[: self.config.max_text_length]
         cached = self.cache.get(text)
         if cached is not None:
+            detected = self.service.resolve_source_language(text)
+            result = build_translation_result(
+                source_text=text,
+                translated_text=cached,
+                source_lang=detected,
+                target_lang=self.config.target_lang,
+                from_cache=True,
+            )
             self.last_processed_text = text
             self.last_processed_at = time.monotonic()
-            self.show_translation(text, cached, "Translated (cache)")
-            self._log("translation served from cache")
+            self.show_translation(result)
+            self._log(f"translation served from cache ({result.status})")
             return
 
         started_at = self.in_flight.get(text)
@@ -925,43 +1105,49 @@ class TkTranslatorApp:
             self.in_flight.pop(text, None)
 
         self.in_flight[text] = time.monotonic()
-        self.show_status("Translating...")
+        detected = self.service.resolve_source_language(text)
+        self._set_status_display(f"翻译中：{format_route_label(detected, self.config.target_lang)}...")
         worker = threading.Thread(target=self._translate_worker, args=(text,), daemon=True)
         worker.start()
 
     def _translate_worker(self, text: str) -> None:
         try:
-            translated = self.service.translate(text)
-            self.result_queue.put((text, translated, None))
+            result = self.service.translate(text)
+            self.result_queue.put((result, None, text))
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            self.result_queue.put((text, None, str(exc)))
+            self.result_queue.put((None, str(exc), text))
 
     def _process_result_queue(self) -> None:
         if not self._running:
             return
         while True:
             try:
-                source_text, translated, error = self.result_queue.get_nowait()
+                result, error, source_text = self.result_queue.get_nowait()
             except queue.Empty:
                 break
 
             self.in_flight.pop(source_text, None)
-            self.last_processed_text = source_text
-            self.last_processed_at = time.monotonic()
 
             if error is not None:
                 self.show_error(source_text, error)
                 self._log(f"translation request failed: {error}")
                 continue
 
-            if translated is None or not translated.strip():
-                self.show_error(source_text, "Empty translation output")
+            if result is None:
+                continue
+
+            self.last_processed_text = result.source_text
+            self.last_processed_at = time.monotonic()
+
+            if not result.translated_text.strip():
+                self.show_error(result.source_text, "Empty translation output")
                 self._log("translation request failed: empty output")
                 continue
 
-            self.cache.set(source_text, translated)
-            self.show_translation(source_text, translated, "Translated")
-            self._log("translation request succeeded")
+            if not result.skipped:
+                self.cache.set(result.source_text, result.translated_text)
+            self.show_translation(result)
+            self._log(f"translation request succeeded ({result.status})")
 
         self.root.after(80, self._process_result_queue)
 
@@ -976,27 +1162,31 @@ class TkTranslatorApp:
         self._process_pending_text(force=True)
 
     def show_status(self, text: str) -> None:
-        self.source_var.set("")
+        self._set_source_display("")
         self._set_translated_display("")
-        self.status_var.set(text)
+        self._set_status_display(text)
         self.root.update_idletasks()
 
-    def show_translation(self, source_text: str, translated_text: str, status: str) -> None:
-        source_preview = source_text if len(source_text) <= 160 else source_text[:157] + "..."
-        self.source_var.set(source_preview)
-        self._set_translated_display(translated_text)
-        self.status_var.set(status)
+    def show_translation(self, result: TranslationResult) -> None:
+        source_preview = result.source_text if len(result.source_text) <= 160 else result.source_text[:157] + "..."
+        self._set_source_display(source_preview)
+        if result.skipped:
+            self._set_translated_display("（已是中文，无需翻译）")
+        else:
+            self._set_translated_display(result.translated_text)
+        self._set_status_display(result.status)
         self.root.update_idletasks()
 
     def show_error(self, source_text: str, error_message: str) -> None:
         source_preview = source_text[:160]
         short_error = error_message if len(error_message) <= 120 else error_message[:117] + "..."
-        self.source_var.set(source_preview)
+        self._set_source_display(source_preview)
         self._set_translated_display("")
-        self.status_var.set(f"Translation failed: {short_error}")
+        self._set_status_display(f"翻译失败：{short_error}")
         self.root.update_idletasks()
 
     def run(self) -> int:
+        self._ensure_window_shown()
         self._log("tkinter UI started")
         self.root.mainloop()
         return 0
@@ -1021,6 +1211,11 @@ def main() -> int:
     config = AppConfig.from_env()
 
     print("[clipboard-translator] starting tkinter UI...", flush=True)
+    print(
+        "[clipboard-translator] languages: "
+        f"{','.join(config.supported_source_langs)} -> {config.target_lang}",
+        flush=True,
+    )
     try:
         service = TranslatorService(config)
         app = TkTranslatorApp(config, service)

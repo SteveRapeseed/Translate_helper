@@ -1,59 +1,56 @@
-# Clipboard Translator
+# Translate Helper
 
-一个常驻桌面的剪贴板实时翻译小工具：
+英 / 日 / 韩 / 越 → 简体中文。
 
-- 监听剪贴板文本变化
-- 自动调用 HuggingFace 模型翻译
-- 悬浮窗口始终置顶
-- 可拖动位置、可手动触发翻译
+**当前阶段：优先完善电脑端（剪贴板复制翻译）**  
+手机端工程已预留于 `android/`，后续再开发。
 
-## 快速开始
+## 项目结构
 
-1. 进入项目目录并激活虚拟环境：
+```text
+translation_helper/
+├── shared/          # 共用翻译逻辑
+├── desktop/         # 【当前主力】电脑端：复制 → 自动翻译
+├── android/         # 【后续】手机端（悬浮球 / 读屏，暂未主攻）
+└── .env             # 电脑端配置（也可用 desktop/.env）
+```
+
+## 电脑端（现在就用这个）
+
+复制外语文本即可自动翻译，无需其他操作。
 
 ```bash
 cd /home/lenovo/translation_helper
 source .venv/bin/activate
+pip install -r desktop/requirements.txt
+python desktop/app.py
 ```
 
-2. 安装依赖：
+配置：复制 `.env` 或参考 `desktop/.env.example`，至少填写 `HF_TOKEN`。
 
-```bash
-python -m pip install -r requirements.txt
-```
+详见 [`desktop/README.md`](desktop/README.md)
 
-3. 配置 `.env`（至少设置 `HF_TOKEN`）：
+## 手机端（后续）
 
-```dotenv
-HF_TOKEN="hf_xxx_your_token"
-HF_BASE_URL="https://router.huggingface.co/v1"
-HF_LLM_MODEL="moonshotai/Kimi-K2-Instruct-0905"
-```
+Android 工程在 [`android/`](android/)，等电脑端稳定后再继续。
 
-4. 运行：
+详见 [`android/README.md`](android/README.md)
 
-```bash
-python app.py
-```
+## 共用核心
 
-## 说明
+| 能力 | Python (`shared/`) | Kotlin (`android/`) |
+| --- | --- | --- |
+| 语言识别 | `detect_source_language` | `detectSourceLanguage` |
+| Prompt | `build_system_prompt` | `buildSystemPrompt` |
+| 翻译 API | HuggingFace Router | HuggingFace Router |
 
-- 程序运行时占用当前终端，这是正常现象（GUI 事件循环）。
-- 关闭窗口的 `x` 按钮即可退出程序。
-- 如果复制后没有立刻翻译，可以点窗口右上角 `Translate Now` 手动触发。
-- 若系统缺少中文字体，程序会自动尝试加载/下载 CJK 字体并以图片方式渲染译文，避免方框字符。
+修改翻译规则时，请同步 [`shared/translation_core.py`](shared/translation_core.py) 与 [`android/.../TranslationCore.kt`](android/app/src/main/java/com/translatehelper/TranslationCore.kt)，并参考 [`shared/CORE_SPEC.md`](shared/CORE_SPEC.md)。
 
-## 常用配置（`.env`）
+## 支持语言
 
-- `HF_TOKEN`：必填
-- `HF_BASE_URL`：默认 `https://router.huggingface.co/v1`
-- `HF_LLM_MODEL`：默认 `Qwen/Qwen2.5-7B-Instruct`
-- `SOURCE_LANG`：默认 `auto`
-- `TARGET_LANG`：默认 `zh-CN`
-- `CLIPBOARD_POLL_MS`：默认 `500`
-- `MIN_TEXT_LENGTH`：默认 `1`（支持中文单字触发翻译）
-- `DEBOUNCE_MS`：默认 `350`
-- `LOG_EVENTS`：默认 `true`
-- `HF_USE_ENV_PROXY`：默认 `false`（通常建议保持 false）
-- `HF_RETRY_COUNT`：默认 `3`（遇到 503/429/5xx 自动重试次数）
-- `HF_RETRY_BACKOFF_SECONDS`：默认 `1.2`（重试退避基准秒数）
+| 源语言 | 代码 | 目标 |
+| --- | --- | --- |
+| 英语 | en | zh-CN |
+| 日语 | ja | zh-CN |
+| 韩语 | ko | zh-CN |
+| 越南语 | vi | zh-CN |

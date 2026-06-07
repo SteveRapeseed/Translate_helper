@@ -3,3 +3,13 @@
 __pycache__/
 *.pyc
 .font-cache/
+desktop/.font-cache/
+
+# Android
+android/local.properties
+android/.gradle/
+android/**/build/
+android/.idea/
+android/*.iml
+android/captures/
+android/.cxx/

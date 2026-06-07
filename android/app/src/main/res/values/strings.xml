@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Translate Helper</string>
+    <string name="accessibility_service_label">Translate Helper 读屏</string>
+    <string name="accessibility_service_description">读取当前屏幕文字，用于点击悬浮球后翻译。不会定时截图，仅在您点击时读取。</string>
+    <string name="bubble_notification_title">Translate Helper 悬浮球</string>
+    <string name="bubble_notification_text">点击悬浮球翻译当前屏幕文字</string>
+    <string name="clipboard_notification_title">Translate Helper 剪贴板</string>
+    <string name="clipboard_notification_text">复制外语后自动翻译</string>
+    <string name="main_subtitle">MVP：悬浮球单击翻译 · 无障碍读屏 · 区域 OCR 兜底</string>
+    <string name="btn_start_bubble">启动悬浮球</string>
+    <string name="btn_stop_bubble">停止悬浮球</string>
+    <string name="btn_open_accessibility">开启无障碍读屏</string>
+    <string name="btn_open_overlay">开启悬浮窗权限</string>
+    <string name="label_clipboard_monitor">剪贴板自动翻译（可选）</string>
+    <string name="hint_token">HF Token（留空则使用 local.properties）</string>
+    <string name="status_ready">就绪</string>
+    <string name="ocr_hint">拖动框选区域，松开开始 OCR</string>
+</resources>

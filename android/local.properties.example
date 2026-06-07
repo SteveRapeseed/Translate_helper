@@ -1,0 +1,5 @@
+# Copy to android/local.properties and fill in your values.
+sdk.dir=/path/to/Android/Sdk
+HF_TOKEN=hf_xxx
+HF_BASE_URL=https://router.huggingface.co/v1
+HF_LLM_MODEL=moonshotai/Kimi-K2-Instruct-0905
