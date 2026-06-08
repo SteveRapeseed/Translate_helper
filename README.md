@@ -17,18 +17,28 @@ translation_helper/
 
 ## 电脑端（现在就用这个）
 
-复制外语文本即可自动翻译，无需其他操作。
+### 独立 App（推荐，解压即用）
 
 ```bash
-cd /home/lenovo/translation_helper
-source .venv/bin/activate
-pip install -r desktop/requirements.txt
-python desktop/app.py
+# 构建（或直接使用 dist/TranslateHelper-0.1.0-linux.tar.gz）
+bash build-app.sh
+
+# 使用
+tar -xzf dist/TranslateHelper-0.1.0-linux.tar.gz
+cd TranslateHelper-0.1.0-linux
+cp .env.example .env && nano .env   # 填 HF_TOKEN
+./启动翻译助手.sh
 ```
 
-配置：复制 `.env` 或参考 `desktop/.env.example`，至少填写 `HF_TOKEN`。
+Windows 独立版：在 Windows 上运行 `build-app.bat`，然后双击 `启动翻译助手.bat`。
 
-详见 [`desktop/README.md`](desktop/README.md)
+完整说明见 [`下载使用.md`](下载使用.md)
+
+### 源码安装
+
+```bash
+bash install.sh && ./run.sh
+```
 
 ## 手机端（后续）
 

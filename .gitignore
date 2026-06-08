@@ -1,9 +1,15 @@
 .env
 .venv/
+.config/
+dist/
 __pycache__/
 *.pyc
 .font-cache/
 desktop/.font-cache/
+
+# Python package
+translate_helper*.egg-info/
+*.egg-info/
 
 # Android
 android/local.properties
@@ -13,3 +19,6 @@ android/.idea/
 android/*.iml
 android/captures/
 android/.cxx/
+
+# PyInstaller
+build/

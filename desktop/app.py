@@ -11,9 +11,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_DESKTOP_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _DESKTOP_DIR.parent
-_SHARED_DIR = _REPO_ROOT / "shared"
+
+def _resolve_runtime_paths() -> tuple[Path, Path, Path, Path]:
+    if getattr(sys, "frozen", False):
+        bundle = Path(getattr(sys, "_MEIPASS"))
+        install = Path(sys.executable).resolve().parent
+        return bundle / "desktop", bundle, bundle / "shared", install
+    desktop = Path(__file__).resolve().parent
+    root = desktop.parent
+    return desktop, root, root / "shared", root
+
+
+_DESKTOP_DIR, _REPO_ROOT, _SHARED_DIR, _INSTALL_ROOT = _resolve_runtime_paths()
 if str(_SHARED_DIR) not in sys.path:
     sys.path.insert(0, str(_SHARED_DIR))
 
@@ -59,6 +68,9 @@ def env_bool(name: str, default: bool) -> bool:
 def load_env_file(path: str | None = None) -> None:
     if path is None:
         candidates = [
+            _INSTALL_ROOT / ".env",
+            Path.home() / ".config" / "translate-helper" / ".env",
+            _REPO_ROOT / ".config" / "translate-helper" / ".env",
             _DESKTOP_DIR / ".env",
             _REPO_ROOT / ".env",
         ]
@@ -117,6 +129,7 @@ class AppConfig:
     hf_use_env_proxy: bool
     hf_retry_count: int
     hf_retry_backoff_seconds: float
+    panel_auto_hide_ms: int
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -150,6 +163,7 @@ class AppConfig:
             hf_use_env_proxy=env_bool("HF_USE_ENV_PROXY", False),
             hf_retry_count=env_int("HF_RETRY_COUNT", 3),
             hf_retry_backoff_seconds=env_float("HF_RETRY_BACKOFF_SECONDS", 1.2),
+            panel_auto_hide_ms=env_int("PANEL_AUTO_HIDE_MS", 15000),
         )
 
 
@@ -417,9 +431,13 @@ class TranslatorService:
 
 class TkTranslatorApp:
     URL_ONLY_RE = re.compile(r"^\s*https?://\S+\s*$", re.IGNORECASE)
-    TOPMOST_ENFORCE_MS = 90
-    TOPMOST_X11_REAPPLY_EVERY = 8
-    TOPMOST_HARD_RESET_COOLDOWN_MS = 1000
+    BUBBLE_SIZE = 68
+    BUBBLE_SHELL_BG = "#0B1220"
+    PANEL_WIDTH = 460
+    PANEL_HEIGHT = 230
+    VISIBILITY_CHECK_MS = 800
+    TOPMOST_ENFORCE_MS = 200
+    TOPMOST_HARD_RESET_SEC = 2.0
 
     def __init__(self, config: AppConfig, service: TranslatorService):
         self.config = config
@@ -438,22 +456,29 @@ class TkTranslatorApp:
         self._dragging = False
         self._drag_start_x = 0
         self._drag_start_y = 0
-        self._iconic_retry_count = 0
-        self._last_iconic_log_at = 0.0
-        self._iconic_warned = False
+        self._panel_expanded = False
+        self._panel_pinned = False
+        self._auto_hide_after_id: str | None = None
+        self._anchor_tr_x = 0
+        self._anchor_tr_y = 0
+        self._visibility_warned = False
+        self._last_visibility_signature = ""
+        self._recover_cooldown_until = 0.0
         self._topmost_tick = 0
-        self._xprop_supported = False
-        self._last_hard_reset_at = 0.0
+        self._last_hard_topmost_at = 0.0
+        self._bubble_photo = None
+        self._bubble_active = False
 
         self.root = tk.Tk()
-        self.root.title("Clipboard Translator")
-        self.root.geometry("460x230")
-        self.root.minsize(420, 190)
-        self.root.configure(bg="#111827")
+        self.root.withdraw()
+        self.root.title("翻译助手")
+        self.root.configure(bg=self.BUBBLE_SHELL_BG)
+        self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.wm_attributes("-topmost", 1)
-        self._apply_platform_topmost_hint()
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self.root.bind("<Control-Shift-T>", lambda _event: self.translate_now())
+        self.root.bind("<Control-Shift-t>", lambda _event: self.translate_now())
         self._font_family = self._select_display_font_family()
         self._pil_image = None
         self._pil_draw = None
@@ -467,30 +492,52 @@ class TkTranslatorApp:
         self._init_image_text_renderer()
 
         self._build_ui()
-        self._render_static_title()
-        self._place_top_right()
-        self._init_x11_topmost_support()
-        self._ensure_window_shown()
-        self._enforce_topmost()
-        self.root.after(0, self._ensure_window_shown)
-        self.root.after(200, self._ensure_window_shown)
-        self.root.bind("<FocusIn>", lambda _event: self._enforce_topmost())
-        self.root.bind("<FocusOut>", lambda _event: self._schedule_topmost_burst())
-        self.root.bind("<Map>", lambda _event: self._enforce_topmost())
-        self.root.bind("<Visibility>", lambda _event: self._schedule_topmost_burst())
-        self.show_status("就绪：复制英语/日语/韩语/越南语文本，自动译为中文。")
+        self._place_initial_bubble()
+        self._finalize_window_show()
+        self._log("就绪：复制外语文本自动翻译；Ctrl+Shift+T 手动触发")
+        if self._running_on_wsl():
+            self._log("提示：WSL 版不能盖住 Chrome/Edge 等浏览器，需用 Windows 版才能全局置顶")
 
+        self.root.after(0, self._finalize_window_show)
+        self.root.after(300, self._finalize_window_show)
+        self.root.after(1000, self._finalize_window_show)
+        self.root.after(self.VISIBILITY_CHECK_MS, self._keep_window_visible)
+        self.root.after(self.TOPMOST_ENFORCE_MS, self._enforce_topmost)
+        self.root.bind("<Map>", lambda _event: self._raise_to_front())
+        self.root.bind("<FocusOut>", lambda _event: self._raise_to_front())
         self.root.after(max(100, config.clipboard_poll_ms), self._poll_clipboard)
         self.root.after(80, self._process_result_queue)
-        self.root.after(1500, self._keep_window_visible)
-        self.root.after(self.TOPMOST_ENFORCE_MS, self._keep_topmost)
 
     def _log(self, message: str) -> None:
         if self.config.log_events:
-            print(f"[clipboard-translator][tk] {message}", flush=True)
+            print(f"[translate-helper][tk] {message}", flush=True)
 
     def _build_ui(self) -> None:
-        card = tk.Frame(self.root, bg="#111827", bd=1, relief="solid")
+        self.shell = tk.Frame(self.root, bg=self.BUBBLE_SHELL_BG, bd=0, highlightthickness=0)
+        self.shell.pack(fill="both", expand=True)
+
+        self.bubble_view = tk.Frame(
+            self.shell,
+            bg=self.BUBBLE_SHELL_BG,
+            width=self.BUBBLE_SIZE,
+            height=self.BUBBLE_SIZE,
+            bd=0,
+            highlightthickness=0,
+        )
+        self.bubble_view.pack_propagate(False)
+        self.bubble_label = tk.Label(
+            self.bubble_view,
+            bg=self.BUBBLE_SHELL_BG,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.bubble_label.pack(expand=True)
+        self._refresh_bubble_skin()
+
+        self.panel_view = tk.Frame(self.shell, bg="#111827", bd=1, relief="solid")
+
+        card = tk.Frame(self.panel_view, bg="#111827")
         card.pack(fill="both", expand=True, padx=1, pady=1)
 
         top_row = tk.Frame(card, bg="#111827")
@@ -503,8 +550,41 @@ class TkTranslatorApp:
             fg="#f9fafb",
             bg="#111827",
         )
-        title.pack(side="left")
+        title.pack(side="left", fill="x", expand=True)
         self.title_label = title
+
+        controls = tk.Frame(top_row, bg="#111827")
+        controls.pack(side="right")
+
+        self.pin_btn = tk.Button(
+            controls,
+            text="钉住",
+            command=self._toggle_pin,
+            relief="flat",
+            bg="#374151",
+            fg="#F9FAFB",
+            activebackground="#4B5563",
+            activeforeground="#F9FAFB",
+            padx=8,
+            pady=2,
+            cursor="hand2",
+        )
+        self.pin_btn.pack(side="left", padx=(0, 4))
+
+        self.close_btn = tk.Button(
+            controls,
+            text="关闭",
+            command=self._collapse_to_bubble,
+            relief="flat",
+            bg="#374151",
+            fg="#F9FAFB",
+            activebackground="#4B5563",
+            activeforeground="#F9FAFB",
+            padx=8,
+            pady=2,
+            cursor="hand2",
+        )
+        self.close_btn.pack(side="left")
 
         self.source_label = tk.Label(
             card,
@@ -539,19 +619,398 @@ class TkTranslatorApp:
         )
         self.status_label.pack(fill="x", padx=10, pady=(0, 8))
 
-        for widget in (top_row, title):
+        drag_targets = (self.bubble_view, self.bubble_label, top_row, title, self.panel_view, card)
+        for widget in drag_targets:
             widget.bind("<ButtonPress-1>", self._on_drag_start)
             widget.bind("<B1-Motion>", self._on_drag_move)
             widget.bind("<ButtonRelease-1>", self._on_drag_end)
 
-    def _place_top_right(self) -> None:
+        self.bubble_label.bind("<Double-Button-1>", lambda _event: self.translate_now())
+        self.bubble_view.bind("<Button-3>", lambda _event: self.shutdown())
+
+        self.panel_view.pack_forget()
+        self.bubble_view.pack(fill="both", expand=True)
+        self._panel_expanded = False
+
+    def _sync_anchor_from_window(self) -> None:
         self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = max(0, self.root.winfo_screenwidth() - width - self.config.margin_px)
-        y = max(0, self.config.margin_px)
+        self._anchor_tr_x = self.root.winfo_x() + self.root.winfo_width()
+        self._anchor_tr_y = self.root.winfo_y()
+
+    def _apply_geometry(self, width: int, height: int) -> None:
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        margin = max(0, self.config.margin_px)
+        x = self._anchor_tr_x - width
+        y = self._anchor_tr_y
+        if x < margin:
+            x = margin
+        if y < margin:
+            y = margin
+        if x + width > screen_w - margin:
+            x = max(margin, screen_w - width - margin)
+        if y + height > screen_h - margin:
+            y = max(margin, screen_h - height - margin)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self._anchor_tr_x = x + width
+        self._anchor_tr_y = y
         self._clamp_window_to_screen()
+
+    def _place_initial_bubble(self) -> None:
+        margin = max(0, self.config.margin_px)
+        screen_w = max(800, self.root.winfo_screenwidth())
+        screen_h = max(600, self.root.winfo_screenheight())
+        if self._running_on_wsl():
+            # WSLg 下居中更容易看到；用户拖动后会记住新位置
+            self._anchor_tr_x = int(screen_w * 0.52)
+            self._anchor_tr_y = int(screen_h * 0.42)
+        else:
+            self._anchor_tr_x = min(screen_w - margin, max(margin + self.BUBBLE_SIZE, int(screen_w * 0.75)))
+            self._anchor_tr_y = max(margin, int(screen_h * 0.15))
+        self._collapse_to_bubble(initial=True)
+        self._log(f"小球位置: 屏幕 {screen_w}x{screen_h}, 锚点 ({self._anchor_tr_x}, {self._anchor_tr_y})")
+
+    def _expand_panel(self, schedule_hide: bool = True) -> None:
+        if self._panel_expanded:
+            if schedule_hide:
+                self._schedule_auto_hide()
+            return
+        self._sync_anchor_from_window()
+        self.shell.configure(bg="#111827")
+        self.root.configure(bg="#111827")
+        self.bubble_view.pack_forget()
+        self.panel_view.pack(fill="both", expand=True)
+        self._panel_expanded = True
+        self._render_static_title()
+        self.root.update_idletasks()
+        self._apply_geometry(self.PANEL_WIDTH, self.PANEL_HEIGHT)
+        self._finalize_window_show()
+        if schedule_hide and not self._panel_pinned:
+            self._schedule_auto_hide()
+
+    def _collapse_to_bubble(self, initial: bool = False) -> None:
+        self._cancel_auto_hide()
+        if self._panel_expanded:
+            self._sync_anchor_from_window()
+        self.panel_view.pack_forget()
+        self.shell.configure(bg=self.BUBBLE_SHELL_BG)
+        self.root.configure(bg=self.BUBBLE_SHELL_BG)
+        self.bubble_view.pack(fill="both", expand=True)
+        self._panel_expanded = False
+        if not initial:
+            self._panel_pinned = False
+            self.pin_btn.configure(text="钉住", bg="#374151")
+        self._refresh_bubble_skin()
+        self.root.update_idletasks()
+        self._apply_geometry(self.BUBBLE_SIZE, self.BUBBLE_SIZE)
+        if not initial:
+            self._finalize_window_show()
+
+    def _raise_to_front(self) -> None:
+        if not self._running or self._dragging:
+            return
+        try:
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.wm_attributes("-topmost", 1)
+            self._apply_platform_topmost()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _is_windows_native() -> bool:
+        return sys.platform == "win32"
+
+    def _resolve_windows_hwnd(self) -> int | None:
+        if not self._is_windows_native():
+            return None
+        try:
+            import ctypes
+
+            hwnd = int(self.root.winfo_id())
+            if hwnd <= 0:
+                return None
+            parent = int(ctypes.windll.user32.GetParent(hwnd))
+            return parent if parent > 0 else hwnd
+        except Exception:  # pylint: disable=broad-exception-caught
+            return None
+
+    def _apply_windows_topmost(self) -> None:
+        hwnd = self._resolve_windows_hwnd()
+        if hwnd is None:
+            return
+        try:
+            import ctypes
+
+            HWND_TOPMOST = -1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    def _apply_platform_topmost(self) -> None:
+        if self._is_windows_native():
+            self._apply_windows_topmost()
+        elif self._running_on_wsl() or sys.platform.startswith("linux"):
+            self._apply_x11_above_state()
+
+    def _apply_x11_above_state(self) -> None:
+        xprop = shutil.which("xprop")
+        if not xprop:
+            return
+        try:
+            window_id = self.root.winfo_id()
+            subprocess.run(
+                [
+                    xprop,
+                    "-id",
+                    str(window_id),
+                    "-f",
+                    "_NET_WM_STATE",
+                    "32a",
+                    "-set",
+                    "_NET_WM_STATE",
+                    "_NET_WM_STATE_ABOVE",
+                ],
+                timeout=1,
+                check=False,
+                capture_output=True,
+            )
+        except (OSError, subprocess.TimeoutExpired, tk.TclError):
+            pass
+
+    def _enforce_topmost(self) -> None:
+        if not self._running:
+            return
+        try:
+            self._topmost_tick += 1
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.wm_attributes("-topmost", 1)
+
+            now = time.monotonic()
+            if now - self._last_hard_topmost_at >= self.TOPMOST_HARD_RESET_SEC:
+                self._last_hard_topmost_at = now
+                self.root.attributes("-topmost", False)
+                self.root.update_idletasks()
+                self.root.attributes("-topmost", True)
+                self.root.wm_attributes("-topmost", 1)
+                self.root.lift()
+
+            if self._topmost_tick % 3 == 0:
+                self._apply_platform_topmost()
+        except tk.TclError:
+            pass
+        self.root.after(self.TOPMOST_ENFORCE_MS, self._enforce_topmost)
+
+    def _visibility_signature(self) -> str:
+        try:
+            return (
+                f"{self.root.state()}|{self.root.winfo_ismapped()}|{self.root.winfo_viewable()}|"
+                f"{self.root.winfo_geometry()}|{self._panel_expanded}"
+            )
+        except tk.TclError:
+            return "error"
+
+    def _window_position_invalid(self) -> bool:
+        try:
+            self.root.update_idletasks()
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            width = max(1, self.root.winfo_width())
+            height = max(1, self.root.winfo_height())
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            margin = max(0, self.config.margin_px)
+            if width < 20 or height < 20:
+                return True
+            if x + width < margin or y + height < margin:
+                return True
+            if x > screen_w - margin or y > screen_h - margin:
+                return True
+        except tk.TclError:
+            return True
+        return False
+
+    def _expected_window_size(self) -> tuple[int, int]:
+        if self._panel_expanded:
+            return self.PANEL_WIDTH, self.PANEL_HEIGHT
+        return self.BUBBLE_SIZE, self.BUBBLE_SIZE
+
+    def _log_visibility_state(self, tag: str) -> None:
+        if not self.config.log_events:
+            return
+        signature = self._visibility_signature()
+        if signature == self._last_visibility_signature and tag == "window":
+            return
+        self._last_visibility_signature = signature
+        try:
+            self._log(
+                f"{tag}: state={self.root.state()} mapped={self.root.winfo_ismapped()} "
+                f"viewable={self.root.winfo_viewable()} geom={self.root.winfo_geometry()} "
+                f"expanded={self._panel_expanded}"
+            )
+        except tk.TclError:
+            pass
+
+    def _hard_recover_window(self) -> None:
+        if not self._running or self._dragging:
+            return
+        now = time.monotonic()
+        if now < self._recover_cooldown_until:
+            return
+        self._recover_cooldown_until = now + 1.5
+        try:
+            width, height = self._expected_window_size()
+            if self._window_position_invalid():
+                margin = max(0, self.config.margin_px)
+                screen_w = max(800, self.root.winfo_screenwidth())
+                screen_h = max(600, self.root.winfo_screenheight())
+                if self._running_on_wsl():
+                    self._anchor_tr_x = int(screen_w * 0.52)
+                    self._anchor_tr_y = int(screen_h * 0.42)
+                else:
+                    self._anchor_tr_x = min(screen_w - margin, max(margin + self.BUBBLE_SIZE, int(screen_w * 0.75)))
+                    self._anchor_tr_y = max(margin, int(screen_h * 0.15))
+            self.root.withdraw()
+            self.root.update_idletasks()
+            self._apply_geometry(width, height)
+            self.root.deiconify()
+            self.root.attributes("-topmost", False)
+            self.root.update_idletasks()
+            self.root.attributes("-topmost", True)
+            self.root.wm_attributes("-topmost", 1)
+            self.root.lift()
+            self._apply_platform_topmost()
+            self.root.update_idletasks()
+            self._clamp_window_to_screen()
+            self._log_visibility_state("recover")
+        except tk.TclError:
+            pass
+
+    def _finalize_window_show(self) -> None:
+        try:
+            state = self.root.state()
+            if state in {"withdrawn", "iconic"}:
+                self.root.deiconify()
+            width, height = self._expected_window_size()
+            self.root.update_idletasks()
+            if self.root.winfo_width() < 20 or self.root.winfo_height() < 20 or self._window_position_invalid():
+                self._apply_geometry(width, height)
+            self.root.attributes("-topmost", True)
+            self.root.wm_attributes("-topmost", 1)
+            self.root.lift()
+            self._apply_platform_topmost()
+            self.root.update_idletasks()
+            self._clamp_window_to_screen()
+            if not self.root.winfo_viewable() and not self._visibility_warned:
+                self._visibility_warned = True
+                if self._running_on_wsl():
+                    self._log("WSL 模式无法始终浮在 Windows 浏览器上，请改用 Windows 版：运行 build-app.bat")
+                else:
+                    self._log("窗口可能未显示，请确认在桌面会话中运行")
+            self._log_visibility_state("window")
+        except tk.TclError:
+            pass
+
+    def _keep_window_visible(self) -> None:
+        if not self._running:
+            return
+        try:
+            state = self.root.state()
+            mapped = self.root.winfo_ismapped()
+            viewable = self.root.winfo_viewable()
+            if (
+                state in {"withdrawn", "iconic"}
+                or not mapped
+                or not viewable
+                or self._window_position_invalid()
+            ):
+                self._hard_recover_window()
+        except tk.TclError:
+            pass
+        self.root.after(self.VISIBILITY_CHECK_MS, self._keep_window_visible)
+
+    def _toggle_pin(self) -> None:
+        self._panel_pinned = not self._panel_pinned
+        if self._panel_pinned:
+            self.pin_btn.configure(text="已钉", bg="#1D4ED8")
+            self._cancel_auto_hide()
+            self._log("panel pinned")
+        else:
+            self.pin_btn.configure(text="钉住", bg="#374151")
+            self._schedule_auto_hide()
+            self._log("panel unpinned")
+
+    def _schedule_auto_hide(self) -> None:
+        if self._panel_pinned or self.config.panel_auto_hide_ms <= 0:
+            return
+        self._cancel_auto_hide()
+        self._auto_hide_after_id = self.root.after(self.config.panel_auto_hide_ms, self._collapse_to_bubble)
+
+    def _cancel_auto_hide(self) -> None:
+        if self._auto_hide_after_id:
+            try:
+                self.root.after_cancel(self._auto_hide_after_id)
+            except tk.TclError:
+                pass
+            self._auto_hide_after_id = None
+
+    def _on_content_activity(self, schedule_hide: bool = True) -> None:
+        self._expand_panel(schedule_hide=schedule_hide)
+        self._finalize_window_show()
+
+    def _bring_to_front(self) -> None:
+        self._finalize_window_show()
+
+    @staticmethod
+    def _running_on_wsl() -> bool:
+        try:
+            with open("/proc/version", encoding="utf-8") as handle:
+                return "microsoft" in handle.read().lower()
+        except OSError:
+            return False
+
+    def _read_windows_clipboard_powershell(self) -> str:
+        ps = shutil.which("powershell.exe")
+        if not ps:
+            return ""
+        try:
+            result = subprocess.run(
+                [ps, "-NoProfile", "-STA", "-Command", "Get-Clipboard -Raw"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if result.returncode != 0 or not isinstance(result.stdout, str):
+            return ""
+        return result.stdout
+
+    @staticmethod
+    def _read_clipboard_via_command() -> str:
+        for cmd in (["wl-paste", "-n"], ["xclip", "-o", "-selection", "clipboard"]):
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and isinstance(result.stdout, str) and result.stdout.strip():
+                return result.stdout
+        return ""
 
     def _clamp_window_to_screen(self) -> None:
         try:
@@ -576,25 +1035,8 @@ class TkTranslatorApp:
 
             if new_x != x or new_y != y:
                 self.root.geometry(f"{width}x{height}+{new_x}+{new_y}")
-        except tk.TclError:
-            pass
-
-    def _ensure_window_shown(self) -> None:
-        try:
-            self.root.deiconify()
-            self.root.state("normal")
-            self._clamp_window_to_screen()
-            self.root.attributes("-topmost", True)
-            self.root.wm_attributes("-topmost", 1)
-            self.root.lift()
-            self.root.update_idletasks()
-            self._log(
-                "window shown "
-                f"state={self.root.state()} "
-                f"mapped={self.root.winfo_ismapped()} "
-                f"geometry={self.root.geometry()} "
-                f"screen={self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}"
-            )
+            self._anchor_tr_x = self.root.winfo_x() + width
+            self._anchor_tr_y = self.root.winfo_y()
         except tk.TclError:
             pass
 
@@ -699,6 +1141,62 @@ class TkTranslatorApp:
             return self._pil_font.truetype(self._pil_font_path, font_size)
         except Exception:  # pylint: disable=broad-exception-caught
             return None
+
+    def _render_bubble_skin(self, *, active: bool = False) -> Any | None:
+        if not (self._pil_image and self._pil_draw and self._pil_imagetk):
+            return None
+
+        size = self.BUBBLE_SIZE
+        shell = self._hex_to_rgb(self.BUBBLE_SHELL_BG)
+        img = self._pil_image.new("RGB", (size, size), shell)
+        draw = self._pil_draw.Draw(img)
+
+        if active:
+            ring = (56, 189, 248)
+            body = (29, 78, 216)
+            shine = (125, 211, 252)
+        else:
+            ring = (59, 130, 246)
+            body = (37, 99, 235)
+            shine = (147, 197, 253)
+
+        draw.ellipse((1, 1, size - 2, size - 2), fill=ring)
+        draw.ellipse((4, 4, size - 5, size - 5), fill=body)
+        draw.ellipse((10, 8, size - 12, size - 14), fill=shine)
+        draw.ellipse((14, 12, size - 20, size - 22), fill=body)
+
+        font = self._load_pil_font(24 if active else 22)
+        if font is not None:
+            glyph = "译"
+            bbox = draw.textbbox((0, 0), glyph, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            text_x = (size - text_w) // 2 - bbox[0]
+            text_y = (size - text_h) // 2 - bbox[1] + 1
+            draw.text((text_x, text_y), glyph, font=font, fill=(255, 255, 255))
+
+        return self._pil_imagetk.PhotoImage(img)
+
+    def _refresh_bubble_skin(self, *, active: bool | None = None) -> None:
+        if active is None:
+            active = self._bubble_active
+        else:
+            self._bubble_active = active
+
+        photo = self._render_bubble_skin(active=active)
+        if photo is not None:
+            self._bubble_photo = photo
+            self.bubble_label.configure(image=photo, text="", bg=self.BUBBLE_SHELL_BG)
+            return
+
+        self._bubble_photo = None
+        self.bubble_label.configure(
+            image="",
+            text="译",
+            fg="#FFFFFF",
+            bg="#2563EB",
+            font=(self._font_family, 16, "bold"),
+        )
 
     def _render_text_to_photo(
         self,
@@ -833,108 +1331,6 @@ class TkTranslatorApp:
             fallback_font=(self._font_family, 9),
         )
 
-    def _apply_platform_topmost_hint(self) -> None:
-        # utility/splash are less likely to be repositioned off-screen than dock on WSLg.
-        for window_type in ("utility", "splash", "dock"):
-            try:
-                self.root.wm_attributes("-type", window_type)
-                self._log(f"using wm window type: {window_type}")
-                return
-            except tk.TclError:
-                continue
-
-    def _init_x11_topmost_support(self) -> None:
-        self._xprop_supported = bool(shutil.which("xprop"))
-        if self._xprop_supported:
-            self._apply_x11_above_state()
-
-    def _apply_x11_above_state(self) -> None:
-        if not self._xprop_supported:
-            return
-        window_id = hex(self.root.winfo_id())
-        cmds = [
-            [
-                "xprop",
-                "-id",
-                window_id,
-                "-f",
-                "_NET_WM_STATE",
-                "32a",
-                "-set",
-                "_NET_WM_STATE",
-                "_NET_WM_STATE_ABOVE,_NET_WM_STATE_STICKY",
-            ],
-            [
-                "xprop",
-                "-id",
-                window_id,
-                "-f",
-                "_NET_WM_WINDOW_TYPE",
-                "32a",
-                "-set",
-                "_NET_WM_WINDOW_TYPE",
-                "_NET_WM_WINDOW_TYPE_UTILITY",
-            ],
-        ]
-        for cmd in cmds:
-            try:
-                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:  # pylint: disable=broad-exception-caught
-                return
-
-    def _aggressive_raise(self) -> None:
-        try:
-            self.root.deiconify()
-            self.root.state("normal")
-        except tk.TclError:
-            pass
-        self._enforce_topmost()
-
-    def _schedule_topmost_burst(self) -> None:
-        # Keep reassert lightweight, with one throttled hard reset as fallback.
-        self._enforce_topmost()
-        self.root.after(70, self._hard_reassert_topmost)
-        self.root.after(220, self._enforce_topmost)
-        self.root.after(420, self._enforce_topmost)
-
-    def _hard_reassert_topmost(self) -> None:
-        if self._dragging or not self._running:
-            return
-        now = time.monotonic()
-        elapsed_ms = (now - self._last_hard_reset_at) * 1000
-        if elapsed_ms < self.TOPMOST_HARD_RESET_COOLDOWN_MS:
-            return
-        self._last_hard_reset_at = now
-
-        try:
-            # Some WMs require a one-shot topmost reset after focus loss.
-            self.root.attributes("-topmost", False)
-            self.root.wm_attributes("-topmost", 0)
-            self.root.attributes("-topmost", True)
-            self.root.wm_attributes("-topmost", 1)
-            self.root.lift()
-            self._apply_x11_above_state()
-            self._clamp_window_to_screen()
-        except tk.TclError:
-            return
-
-    def _enforce_topmost(self) -> None:
-        try:
-            self._topmost_tick += 1
-            self.root.attributes("-topmost", True)
-            self.root.wm_attributes("-topmost", 1)
-            self.root.lift()
-            if self._topmost_tick % self.TOPMOST_X11_REAPPLY_EVERY == 0:
-                self._apply_x11_above_state()
-        except tk.TclError:
-            pass
-
-    def _keep_topmost(self) -> None:
-        if not self._running:
-            return
-        self._enforce_topmost()
-        self.root.after(self.TOPMOST_ENFORCE_MS, self._keep_topmost)
-
     def _on_drag_start(self, event) -> None:
         self._dragging = True
         self._drag_start_x = event.x_root - self.root.winfo_x()
@@ -950,41 +1346,8 @@ class TkTranslatorApp:
 
     def _on_drag_end(self, _event) -> None:
         self._dragging = False
+        self._sync_anchor_from_window()
         self._clamp_window_to_screen()
-
-    def _keep_window_visible(self) -> None:
-        if not self._running:
-            return
-        try:
-            state = self.root.state()
-        except tk.TclError:
-            return
-
-        if state in {"withdrawn", "iconic"}:
-            self._iconic_retry_count += 1
-            now = time.monotonic()
-            if self._iconic_retry_count in {1, 2, 5, 10} or (now - self._last_iconic_log_at) >= 30:
-                self._log(f"window state={state}, restoring (attempt={self._iconic_retry_count})")
-                self._last_iconic_log_at = now
-            if self._iconic_retry_count >= 12 and not self._iconic_warned:
-                self._iconic_warned = True
-                self._log("window manager keeps iconifying this app; GUI session may be unstable.")
-            try:
-                self.root.deiconify()
-                self.root.state("normal")
-            except tk.TclError:
-                pass
-        elif self._iconic_retry_count > 0:
-            self._log(f"window restored after {self._iconic_retry_count} retries")
-            self._iconic_retry_count = 0
-            self._iconic_warned = False
-
-        try:
-            self._enforce_topmost()
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-
-        self.root.after(1500, self._keep_window_visible)
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -994,7 +1357,7 @@ class TkTranslatorApp:
         return compact.strip()
 
     def _read_clipboard_text(self) -> str:
-        candidates = []
+        candidates: list[str] = []
 
         for clip_type in ("UTF8_STRING", "STRING", "TEXT"):
             try:
@@ -1013,7 +1376,17 @@ class TkTranslatorApp:
             if isinstance(value, str) and value.strip():
                 candidates.append(value)
 
+        if not candidates and self._running_on_wsl():
+            value = self._read_windows_clipboard_powershell()
+            if isinstance(value, str) and value.strip():
+                candidates.append(value)
+
         if not candidates:
+            value = self._read_clipboard_via_command()
+            if isinstance(value, str) and value.strip():
+                candidates.append(value)
+
+        if not candidates and not self._running_on_wsl():
             try:
                 value = self.root.selection_get(selection="PRIMARY")
             except Exception:  # pylint: disable=broad-exception-caught
@@ -1028,16 +1401,27 @@ class TkTranslatorApp:
     def _poll_clipboard(self) -> None:
         if not self._running:
             return
-        text = self._read_clipboard_text()
-        if text and text != self.last_seen_clipboard_text:
-            self.last_seen_clipboard_text = text
-            self._queue_text(text, trigger="poll")
+        try:
+            text = self._read_clipboard_text()
+            if text and text != self.last_seen_clipboard_text:
+                self.last_seen_clipboard_text = text
+                self._queue_text(text, trigger="poll")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self._log(f"clipboard poll error: {exc}")
         self.root.after(max(100, self.config.clipboard_poll_ms), self._poll_clipboard)
+
+    def _flash_bubble(self) -> None:
+        if self._panel_expanded:
+            return
+        self._refresh_bubble_skin(active=True)
+        self.root.after(220, lambda: self._refresh_bubble_skin(active=False))
 
     def _queue_text(self, text: str, trigger: str) -> None:
         self.pending_text = text
-        self._log(f"clipboard update received ({trigger}, {len(text)} chars)")
+        self._log(f"检测到新文本 ({trigger}, {len(text)} 字)")
         preview = text if len(text) <= 160 else text[:157] + "..."
+        self._flash_bubble()
+        self._on_content_activity(schedule_hide=False)
         self._set_source_display(preview)
         self._set_status_display("已检测到剪贴板，准备翻译...")
         if self._debounce_after_id:
@@ -1072,6 +1456,7 @@ class TkTranslatorApp:
         reason = None if force else self._skip_reason(text)
         if reason:
             preview = text if len(text) <= 160 else text[:157] + "..."
+            self._on_content_activity(schedule_hide=True)
             self._set_source_display(preview)
             self._set_translated_display("")
             self._set_status_display(f"已跳过：{reason}")
@@ -1106,6 +1491,7 @@ class TkTranslatorApp:
 
         self.in_flight[text] = time.monotonic()
         detected = self.service.resolve_source_language(text)
+        self._on_content_activity(schedule_hide=False)
         self._set_status_display(f"翻译中：{format_route_label(detected, self.config.target_lang)}...")
         worker = threading.Thread(target=self._translate_worker, args=(text,), daemon=True)
         worker.start()
@@ -1154,20 +1540,23 @@ class TkTranslatorApp:
     def translate_now(self) -> None:
         text = self._read_clipboard_text()
         if not text:
-            self.show_status("Clipboard has no text.")
-            self._log("manual translate skipped: clipboard is empty")
+            self._on_content_activity(schedule_hide=True)
+            self._set_status_display("剪贴板没有文本")
+            self._log("手动翻译跳过：剪贴板无文本")
             return
-        self._log("manual translate requested")
+        self._log("手动翻译请求 (Ctrl+Shift+T)")
         self.pending_text = text
         self._process_pending_text(force=True)
 
     def show_status(self, text: str) -> None:
+        self._on_content_activity(schedule_hide=True)
         self._set_source_display("")
         self._set_translated_display("")
         self._set_status_display(text)
         self.root.update_idletasks()
 
     def show_translation(self, result: TranslationResult) -> None:
+        self._on_content_activity(schedule_hide=True)
         source_preview = result.source_text if len(result.source_text) <= 160 else result.source_text[:157] + "..."
         self._set_source_display(source_preview)
         if result.skipped:
@@ -1178,6 +1567,7 @@ class TkTranslatorApp:
         self.root.update_idletasks()
 
     def show_error(self, source_text: str, error_message: str) -> None:
+        self._on_content_activity(schedule_hide=True)
         source_preview = source_text[:160]
         short_error = error_message if len(error_message) <= 120 else error_message[:117] + "..."
         self._set_source_display(source_preview)
@@ -1186,8 +1576,8 @@ class TkTranslatorApp:
         self.root.update_idletasks()
 
     def run(self) -> int:
-        self._ensure_window_shown()
         self._log("tkinter UI started")
+        self.root.after(0, self._finalize_window_show)
         self.root.mainloop()
         return 0
 
@@ -1195,6 +1585,7 @@ class TkTranslatorApp:
         if not self._running:
             return
         self._running = False
+        self._cancel_auto_hide()
         self._log("application exiting")
         try:
             self.root.quit()
@@ -1210,9 +1601,9 @@ def main() -> int:
     load_env_file()
     config = AppConfig.from_env()
 
-    print("[clipboard-translator] starting tkinter UI...", flush=True)
+    print("[translate-helper] 启动界面...", flush=True)
     print(
-        "[clipboard-translator] languages: "
+        "[translate-helper] 语言: "
         f"{','.join(config.supported_source_langs)} -> {config.target_lang}",
         flush=True,
     )
@@ -1220,10 +1611,10 @@ def main() -> int:
         service = TranslatorService(config)
         app = TkTranslatorApp(config, service)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        print(f"[clipboard-translator] GUI init failed: {exc}", flush=True)
+        print(f"[translate-helper] 界面初始化失败: {exc}", flush=True)
         return 2
 
-    print("[clipboard-translator] app running (terminal stays occupied while active).", flush=True)
+    print("[translate-helper] 运行中（终端会保持占用，Ctrl+C 退出）。", flush=True)
     return app.run()
 
 

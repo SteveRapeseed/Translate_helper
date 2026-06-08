@@ -1,6 +1,19 @@
 # Desktop - 电脑端剪贴板翻译
 
-**当前主力版本**：复制外语 → 悬浮窗自动显示中文译文。
+复制外语文本即可自动翻译，无需其他操作。
+
+## 交互说明（智能模式）
+
+| 状态 | 行为 |
+| --- | --- |
+| 平时 | 屏幕角落只有一个小悬浮球「译」 |
+| 复制外语 | 自动翻译并展开面板 |
+| 15 秒后 | 面板自动缩回小球（可在 `.env` 调整 `PANEL_AUTO_HIDE_MS`） |
+| 钉住 | 点击「钉住」后保持展开 |
+| 关闭 | 点击「关闭」立即缩回小球 |
+| 快捷键 | `Ctrl+Shift+T` 手动翻译剪贴板 |
+| 双击小球 | 手动翻译剪贴板 |
+| 右键小球 | 退出程序 |
 
 WSL / Linux / Windows 下的剪贴板实时翻译小工具。
 
@@ -12,15 +25,27 @@ WSL / Linux / Windows 下的剪贴板实时翻译小工具。
 
 ## 快速开始
 
+### 方式 A：一键安装（推荐）
+
+```bash
+cd ~/translation_helper
+bash install.sh
+./run.sh
+```
+
+### 方式 B：手动
+
 ```bash
 cd /home/lenovo/translation_helper
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r desktop/requirements.txt
+pip install -e .
+translate-helper
 ```
 
-配置环境变量（任选其一）：
+配置环境变量（按优先级）：
 
+- `~/.config/translate-helper/.env`（安装后默认）
 - `desktop/.env`
 - 项目根目录 `.env`
 
@@ -32,11 +57,7 @@ SUPPORTED_SOURCE_LANGS="en,ja,ko,vi"
 TARGET_LANG="zh-CN"
 ```
 
-运行：
-
-```bash
-python desktop/app.py
-```
+> **WSL 用户**：请在 Windows Terminal 的 WSL 窗口运行，Cursor 内置终端启动的窗口可能不显示在桌面。
 
 ## 目录
 

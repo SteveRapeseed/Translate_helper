@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "translate-helper"
+version = "0.1.0"
+description = "复制外语文本，自动翻译为简体中文（英/日/韩/越 → 中文）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Translate Helper" }]
+dependencies = [
+    "requests>=2.32.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+translate-helper = "translate_helper.launcher:main"
+
+[project.urls]
+Homepage = "https://github.com/SteveRapeseed/Translate_helper"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["translate_helper*"]

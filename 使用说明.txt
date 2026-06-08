@@ -1,0 +1,15 @@
+Translate Helper 翻译助手（独立版）
+================================
+
+【启动】
+  Windows：双击 启动翻译助手.bat
+  WSL/Linux：./启动翻译助手.sh
+
+【配置】（首次）
+  编辑同目录 .env，填写 HF_TOKEN
+
+【使用】
+  复制外语 → 自动翻译；右键小球退出
+
+【要求】
+  联网；WSL 用户请在 Windows Terminal 运行
