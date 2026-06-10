@@ -22,3 +22,6 @@ android/.cxx/
 
 # PyInstaller
 build/
+
+# Windows offline wheels (bash scripts/download-win-wheels.sh)
+win-wheels/

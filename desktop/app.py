@@ -976,7 +976,16 @@ class TkTranslatorApp:
             return False
 
     def _read_windows_clipboard_powershell(self) -> str:
-        ps = shutil.which("powershell.exe")
+        # Try common locations instead of relying on shutil.which (may fail in PyInstaller)
+        ps = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not ps:
+            for candidate in (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+            ):
+                if os.path.isfile(candidate):
+                    ps = candidate
+                    break
         if not ps:
             return ""
         try:
@@ -1359,6 +1368,7 @@ class TkTranslatorApp:
     def _read_clipboard_text(self) -> str:
         candidates: list[str] = []
 
+        # 1) tkinter clipboard (works in native X11/Wayland)
         for clip_type in ("UTF8_STRING", "STRING", "TEXT"):
             try:
                 value = self.root.clipboard_get(type=clip_type)
@@ -1376,17 +1386,21 @@ class TkTranslatorApp:
             if isinstance(value, str) and value.strip():
                 candidates.append(value)
 
-        if not candidates and self._running_on_wsl():
+        # 2) On native Windows (exe or python), tkinter may not reach system clipboard
+        # Use powershell Get-Clipboard as a reliable fallback on any Windows environment
+        if not candidates:
             value = self._read_windows_clipboard_powershell()
             if isinstance(value, str) and value.strip():
                 candidates.append(value)
 
-        if not candidates:
+        # 3) WSL: fallback to wl-paste / xclip
+        if not candidates and self._running_on_wsl():
             value = self._read_clipboard_via_command()
             if isinstance(value, str) and value.strip():
                 candidates.append(value)
 
-        if not candidates and not self._running_on_wsl():
+        # 4) PRIMARY selection (X11, not WSL)
+        if not candidates and self._running_on_wsl():
             try:
                 value = self.root.selection_get(selection="PRIMARY")
             except Exception:  # pylint: disable=broad-exception-caught
